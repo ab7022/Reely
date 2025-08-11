@@ -17,6 +17,13 @@ class CaptionRequest(BaseModel):
     caption_style: CaptionStyle = Field(default_factory=CaptionStyle)
 
 
+class Step(BaseModel):
+    key: str
+    label: str
+    status: str  # 'queued' | 'active' | 'done' | 'error'
+    at: str
+
+
 class VideoResponse(BaseModel):
     id: str
     user_id: str
@@ -28,6 +35,7 @@ class VideoResponse(BaseModel):
     caption_style: dict
     captioned_video_url: Optional[str] = None
     error: Optional[str] = None
+    steps: Optional[List[Step]] = None
 
 
 class VideosResponse(BaseModel):

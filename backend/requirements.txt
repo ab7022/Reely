@@ -1,11 +1,12 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
-python-firebase-admin==6.2.0
-openai-whisper==20230314
+firebase-admin==6.2.0
+torch
 moviepy==1.0.3
-Pillow==10.1.0
-pydantic==2.5.0
+Pillow
+pydantic==2.7.4
+pydantic-settings==2.10.1
 python-dotenv==1.0.0
 aiofiles==23.2.1
 httpx==0.25.2

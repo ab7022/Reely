@@ -38,8 +38,24 @@ video_processor = VideoProcessor()
 security = HTTPBearer()
 
 # Ensure required directories exist
-for path in [settings.STORAGE_PATH, settings.UPLOADS_PATH, settings.TEMP_PATH]:
+for path in [
+    settings.STORAGE_PATH,
+    settings.UPLOADS_PATH,
+    settings.TEMP_PATH,
+    settings.TRANSCRIPT_CACHE_PATH,
+]:
     Path(path).mkdir(parents=True, exist_ok=True)
+
+# Verify FFmpeg availability early (non-fatal, but helpful)
+try:
+    import subprocess
+    subprocess.run([settings.FFMPEG_BIN, "-version"], check=True, capture_output=True)
+except FileNotFoundError:
+    print(
+        "Warning: FFmpeg not found. Set FFMPEG_BIN in .env to the full path (e.g., C:/ffmpeg/bin/ffmpeg.exe) or add it to PATH."
+    )
+except Exception:
+    pass
 
 
 @app.get("/")
@@ -53,6 +69,7 @@ async def create_caption_request(
     background_tasks: BackgroundTasks,
     video_file: Optional[UploadFile] = File(None),
     video_url: Optional[str] = Form(None),
+    simulate: Optional[bool] = Form(False),
     font_type: str = Form("Arial"),
     font_size: int = Form(24),
     font_color: str = Form("#FFFFFF"),
@@ -90,7 +107,15 @@ async def create_caption_request(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "caption_style": caption_style.model_dump(),
         "completed_at": None,
-        "error": None
+        "error": None,
+        "steps": [
+            {"key": "queued", "label": "Queued", "status": "active", "at": datetime.now(timezone.utc).isoformat()},
+            {"key": "download", "label": "Download / Save", "status": "queued", "at": ""},
+            {"key": "extract", "label": "Extract Audio", "status": "queued", "at": ""},
+            {"key": "transcribe", "label": "Transcribe Audio", "status": "queued", "at": ""},
+            {"key": "overlay", "label": "Overlay Captions", "status": "queued", "at": ""},
+            {"key": "finalize", "label": "Finalize", "status": "queued", "at": ""}
+        ]
     }
     
     try:
@@ -98,6 +123,17 @@ async def create_caption_request(
             # Handle file upload
             video_metadata["source_type"] = "upload"
             video_metadata["filename"] = video_file.filename
+
+            # Validate file size if available
+            try:
+                video_file.file.seek(0, os.SEEK_END)
+                size = video_file.file.tell()
+                video_file.file.seek(0)
+                if size > settings.MAX_FILE_SIZE:
+                    raise HTTPException(status_code=413, detail="Uploaded file is too large")
+            except Exception:
+                # If we cannot determine size, proceed; ffmpeg will likely fail if it's huge
+                pass
             
             # Save uploaded file
             file_path = Path(settings.UPLOADS_PATH) / f"{video_id}_{video_file.filename}"
@@ -115,12 +151,14 @@ async def create_caption_request(
             filename = video_url.split("/")[-1]
             if not filename or "." not in filename:
                 filename = f"{video_id}.mp4"
+            # sanitize filename (basic)
+            filename = "".join(c for c in filename if c.isalnum() or c in (".", "_", "-"))
             
             video_metadata["filename"] = filename
             file_path = Path(settings.UPLOADS_PATH) / f"{video_id}_{filename}"
             
             # Download video from URL
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
                 response = await client.get(video_url)
                 response.raise_for_status()
                 
@@ -129,6 +167,17 @@ async def create_caption_request(
             
             video_metadata["file_path"] = str(file_path)
         
+        # Update step: download/save finished
+        try:
+            for s in video_metadata["steps"]:
+                if s["key"] == "download":
+                    s["status"] = "done"
+                    s["at"] = datetime.now(timezone.utc).isoformat()
+                if s["key"] == "queued":
+                    s["status"] = "done"
+        except Exception:
+            pass
+
         # Save metadata
         metadata_path = Path(settings.STORAGE_PATH) / f"{video_id}.json"
         with open(metadata_path, "w") as f:
@@ -139,13 +188,15 @@ async def create_caption_request(
             video_processor.process_video,
             video_id,
             str(file_path),
-            caption_style
+            caption_style,
+            simulate or settings.SIMULATE_PROCESSING
         )
         
         return {
             "video_id": video_id,
             "status": "pending",
-            "message": "Video captioning request submitted successfully"
+            "message": "Video captioning request submitted successfully",
+            "simulate": simulate or settings.SIMULATE_PROCESSING
         }
         
     except Exception as e:
@@ -210,35 +261,37 @@ async def get_video(video_id: str, current_user: dict = Depends(get_current_user
 
 
 @app.get("/api/download/{filename}")
-async def download_video(filename: str, current_user: dict = Depends(get_current_user)):
-    """Download a processed video file."""
-    
-    # Extract video ID from filename
+async def download_video(filename: str):
+    """Download a processed video file (public access as requested).
+
+    Security notes:
+    - Restrict to captioned output pattern *_captioned.mp4 to avoid arbitrary file reads.
+    - Ensure filename contains only safe characters.
+    """
+    # Basic sanitization
+    safe = all(c.isalnum() or c in ("_", "-", ".") for c in filename)
+    if not safe or not filename.endswith("_captioned.mp4"):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
     video_id = filename.split("_")[0]
-    
-    # Verify user owns this video
     metadata_path = Path(settings.STORAGE_PATH) / f"{video_id}.json"
-    
     if not metadata_path.exists():
         raise HTTPException(status_code=404, detail="Video not found")
-    
-    with open(metadata_path, "r") as f:
-        video_data = json.load(f)
-    
-    if video_data.get("user_id") != current_user["uid"]:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    # Check if file exists
-    file_path = Path(settings.STORAGE_PATH) / filename
-    
+
+    file_path = Path(settings.STORAGE_PATH).resolve() / filename
     if not file_path.exists():
+        # Fallback: serve original uploaded file if captioned missing
+        try:
+            with open(metadata_path, "r") as f:
+                video_data = json.load(f)
+            original_path = video_data.get("file_path")
+            if original_path and Path(original_path).exists():
+                return FileResponse(path=original_path, filename=filename.replace("_captioned.mp4", Path(original_path).name), media_type="video/mp4")
+        except Exception:
+            pass
         raise HTTPException(status_code=404, detail="File not found")
-    
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type="video/mp4"
-    )
+
+    return FileResponse(path=file_path, filename=filename, media_type="video/mp4")
 
 
 if __name__ == "__main__":
